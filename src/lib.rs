@@ -39,12 +39,25 @@ use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+/// Extracts a stable identity key from a work item.
+///
+/// The key is what gets recorded in a checkpoint to mark an item complete, so
+/// it must be derived only from fields that are stable across runs. If two
+/// distinct items produce the same key, the second will be treated as already
+/// done after the first is checkpointed.
+///
+/// The default key extractor is the identity function (the item itself).
+pub type ItemKeyFn = Box<dyn Fn(&Value) -> Value + Send + Sync>;
+
 // ---- errors ---------------------------------------------------------------
 
 #[derive(Debug)]
 pub enum ResumeError {
     NoCheckpoint(String),
-    CheckpointCorrupt { message: String, line_number: Option<usize> },
+    CheckpointCorrupt {
+        message: String,
+        line_number: Option<usize>,
+    },
     Io(std::io::Error),
     Json(serde_json::Error),
     NewlineInPayload,
@@ -54,7 +67,10 @@ impl std::fmt::Display for ResumeError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ResumeError::NoCheckpoint(m) => write!(f, "no checkpoint: {m}"),
-            ResumeError::CheckpointCorrupt { message, line_number } => {
+            ResumeError::CheckpointCorrupt {
+                message,
+                line_number,
+            } => {
                 if let Some(n) = line_number {
                     write!(f, "checkpoint corrupt at line {n}: {message}")
                 } else {
@@ -98,7 +114,12 @@ impl Checkpoint {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs_f64())
             .unwrap_or(0.0);
-        Self { turn, state, completed_items, timestamp }
+        Self {
+            turn,
+            state,
+            completed_items,
+            timestamp,
+        }
     }
 
     /// Serialize to a single JSONL line (no embedded newlines).
@@ -115,19 +136,18 @@ impl Checkpoint {
     /// Parse a single JSONL line back into a Checkpoint.
     pub fn from_json(raw: &str) -> Result<Self, ResumeError> {
         let v: Value = serde_json::from_str(raw)?;
-        let turn = v["turn"].as_u64().ok_or_else(|| ResumeError::Json(
-            serde_json::from_str::<Value>("null").unwrap_err()
-        ))?;
-        let state = v["state"]
-            .as_object()
-            .cloned()
-            .unwrap_or_default();
-        let completed_items = v["completed_items"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default();
+        let turn = v["turn"]
+            .as_u64()
+            .ok_or_else(|| ResumeError::Json(serde_json::from_str::<Value>("null").unwrap_err()))?;
+        let state = v["state"].as_object().cloned().unwrap_or_default();
+        let completed_items = v["completed_items"].as_array().cloned().unwrap_or_default();
         let timestamp = v["timestamp"].as_f64().unwrap_or(0.0);
-        Ok(Checkpoint { turn, state, completed_items, timestamp })
+        Ok(Checkpoint {
+            turn,
+            state,
+            completed_items,
+            timestamp,
+        })
     }
 }
 
@@ -174,7 +194,9 @@ impl Sink for InMemoryStore {
 
     fn load_latest(&self) -> Result<Checkpoint, ResumeError> {
         let rows = self.rows.lock().unwrap();
-        rows.last().cloned().ok_or_else(|| ResumeError::NoCheckpoint("no checkpoints in memory".into()))
+        rows.last()
+            .cloned()
+            .ok_or_else(|| ResumeError::NoCheckpoint("no checkpoints in memory".into()))
     }
 }
 
@@ -195,7 +217,11 @@ impl JsonlStore {
                 let _ = std::fs::create_dir_all(parent);
             }
         }
-        Self { path, fsync: true, lock: Mutex::new(()) }
+        Self {
+            path,
+            fsync: true,
+            lock: Mutex::new(()),
+        }
     }
 
     pub fn no_fsync(mut self) -> Self {
@@ -216,19 +242,25 @@ impl JsonlStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let ckpt = Checkpoint::from_json(&line).map_err(|e| {
-                ResumeError::CheckpointCorrupt {
+            let ckpt =
+                Checkpoint::from_json(&line).map_err(|e| ResumeError::CheckpointCorrupt {
                     message: e.to_string(),
                     line_number: Some(lineno + 1),
-                }
-            })?;
+                })?;
             out.push(ckpt);
         }
         Ok(out)
     }
 
+    /// Number of checkpoints currently persisted in the file.
     pub fn len(&self) -> Result<usize, ResumeError> {
         Ok(self.iter_checkpoints()?.len())
+    }
+
+    /// `true` if the store holds no checkpoints (missing/empty file or only
+    /// blank lines).
+    pub fn is_empty(&self) -> Result<bool, ResumeError> {
+        Ok(self.len()? == 0)
     }
 }
 
@@ -253,9 +285,7 @@ impl Sink for JsonlStore {
     }
 
     fn load_latest(&self) -> Result<Checkpoint, ResumeError> {
-        if !self.path.exists()
-            || self.path.metadata().map(|m| m.len() == 0).unwrap_or(true)
-        {
+        if !self.path.exists() || self.path.metadata().map(|m| m.len() == 0).unwrap_or(true) {
             return Err(ResumeError::NoCheckpoint(format!(
                 "{} is empty or missing",
                 self.path.display()
@@ -276,7 +306,7 @@ impl Sink for JsonlStore {
 /// `checkpoint(new_state)` to persist progress before moving on.
 pub struct Resumable {
     store: Arc<dyn Sink>,
-    item_key: Box<dyn Fn(&Value) -> Value + Send + Sync>,
+    item_key: ItemKeyFn,
     work_items: Vec<Value>,
     state: Map<String, Value>,
     turn: u64,
@@ -293,10 +323,9 @@ impl Resumable {
         store: Arc<dyn Sink>,
         initial_state: Option<Map<String, Value>>,
         work_items: Vec<Value>,
-        item_key: Option<Box<dyn Fn(&Value) -> Value + Send + Sync>>,
+        item_key: Option<ItemKeyFn>,
     ) -> Self {
-        let key_fn: Box<dyn Fn(&Value) -> Value + Send + Sync> = item_key
-            .unwrap_or_else(|| Box::new(|v: &Value| v.clone()));
+        let key_fn: ItemKeyFn = item_key.unwrap_or_else(|| Box::new(|v: &Value| v.clone()));
 
         let (state, turn, completed, resumed) = match store.load_latest() {
             Ok(ckpt) => (ckpt.state, ckpt.turn, ckpt.completed_items, true),
@@ -334,11 +363,7 @@ impl Resumable {
     }
 
     pub fn remaining_items(&self) -> Vec<Value> {
-        let done: HashSet<String> = self
-            .completed
-            .iter()
-            .map(|v| v.to_string())
-            .collect();
+        let done: HashSet<String> = self.completed.iter().map(|v| v.to_string()).collect();
         self.work_items
             .iter()
             .filter(|item| !done.contains(&(self.item_key)(item).to_string()))
@@ -350,11 +375,7 @@ impl Resumable {
 
     /// Returns the next unfinished work item, or `None` if all are done.
     pub fn next_item(&mut self) -> Option<Value> {
-        let done: HashSet<String> = self
-            .completed
-            .iter()
-            .map(|v| v.to_string())
-            .collect();
+        let done: HashSet<String> = self.completed.iter().map(|v| v.to_string()).collect();
         while self.current_idx < self.work_items.len() {
             let item = &self.work_items[self.current_idx];
             let key = (self.item_key)(item);
@@ -384,18 +405,13 @@ impl Resumable {
             let idx = self.current_idx - 1;
             if idx < self.work_items.len() {
                 let key = (self.item_key)(&self.work_items[idx]);
-                let key_str = key.to_string();
-                if !self.completed.iter().any(|c| c.to_string() == key_str) {
+                if !self.completed.contains(&key) {
                     self.completed.push(key);
                 }
             }
         }
         self.turn += 1;
-        let ckpt = Checkpoint::new(
-            self.turn,
-            self.state.clone(),
-            self.completed.clone(),
-        );
+        let ckpt = Checkpoint::new(self.turn, self.state.clone(), self.completed.clone());
         self.store.append(&ckpt)?;
         Ok(ckpt)
     }
@@ -420,7 +436,12 @@ mod tests {
     fn checkpoint_to_from_json() {
         let mut m = Map::new();
         m.insert("x".into(), json!(1));
-        let ckpt = Checkpoint { turn: 3, state: m, completed_items: vec![json!(0)], timestamp: 42.0 };
+        let ckpt = Checkpoint {
+            turn: 3,
+            state: m,
+            completed_items: vec![json!(0)],
+            timestamp: 42.0,
+        };
         let line = ckpt.to_json();
         let restored = Checkpoint::from_json(&line).unwrap();
         assert_eq!(restored.turn, 3);
@@ -524,7 +545,7 @@ mod tests {
         let store = mem_store();
         {
             let mut r = Resumable::new(store.clone(), None, items(2), None);
-            while let Some(_) = r.next_item() {
+            while r.next_item().is_some() {
                 r.checkpoint(None).unwrap();
             }
         }
@@ -540,15 +561,13 @@ mod tests {
             json!({"id": 2, "data": "b"}),
             json!({"id": 3, "data": "c"}),
         ];
-        let key_fn: Box<dyn Fn(&Value) -> Value + Send + Sync> =
-            Box::new(|v| v["id"].clone());
+        let key_fn: Box<dyn Fn(&Value) -> Value + Send + Sync> = Box::new(|v| v["id"].clone());
         {
             let mut r = Resumable::new(store.clone(), None, work_items.clone(), Some(key_fn));
             r.next_item();
             r.checkpoint(None).unwrap();
         }
-        let key_fn2: Box<dyn Fn(&Value) -> Value + Send + Sync> =
-            Box::new(|v| v["id"].clone());
+        let key_fn2: Box<dyn Fn(&Value) -> Value + Send + Sync> = Box::new(|v| v["id"].clone());
         let mut r2 = Resumable::new(store, None, work_items, Some(key_fn2));
         let ids: Vec<u64> = std::iter::from_fn(|| r2.next_item())
             .map(|v| v["id"].as_u64().unwrap())
@@ -585,7 +604,7 @@ mod tests {
         let _ = std::fs::remove_file(&path);
         let store = Arc::new(JsonlStore::new(&path).no_fsync());
         let mut r = Resumable::new(store, None, items(3), None);
-        while let Some(_) = r.next_item() {
+        while r.next_item().is_some() {
             r.checkpoint(None).unwrap();
         }
         let js = JsonlStore::new(&path);
@@ -596,7 +615,10 @@ mod tests {
     #[test]
     fn jsonl_store_missing_file() {
         let store = JsonlStore::new("/tmp/no_such_agent_resume.jsonl");
-        assert!(matches!(store.load_latest(), Err(ResumeError::NoCheckpoint(_))));
+        assert!(matches!(
+            store.load_latest(),
+            Err(ResumeError::NoCheckpoint(_))
+        ));
     }
 
     #[test]
